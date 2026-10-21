@@ -1,0 +1,4 @@
+#!/bin/sh
+# Удобный запуск приложения из любой текущей директории.
+APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$APP_DIR/audit_pro.py" --menu "$@"
