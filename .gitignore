@@ -1,3 +1,7 @@
 __pycache__/
 *.py[cod]
-linux_security_audit.log
+*.log
+.venv/
+.env
+*.json
+!README.md

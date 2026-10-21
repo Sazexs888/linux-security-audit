@@ -19,10 +19,11 @@ import stat
 import subprocess
 import sys
 import unittest
+import tempfile
 from datetime import datetime, timezone
 
-VERSION = "2.0.0"
-LOG_FILE = "linux_security_audit.log"
+VERSION = "2.1.0"
+LOG_FILE = os.path.expanduser("~/.local/share/linux_audit/audit.log")
 
 
 class Color:
@@ -48,6 +49,7 @@ SUID_ALLOWLIST = {
     "/usr/bin/passwd", "/usr/bin/sudo", "/usr/bin/su",
     "/bin/mount", "/usr/bin/mount", "/usr/bin/chsh",
 }
+SUID_IGNORED_PREFIXES = ("/snap/", "/var/lib/snapd/", "/var/lib/docker/", "/var/lib/containerd/")
 SUID_OWNER_COMMANDS = {
     "apt": "dpkg -S", "dnf": "rpm -qf", "zypper": "rpm -qf",
     "pacman": "pacman -Qo", "apk": "apk info --who-owns",
@@ -61,9 +63,11 @@ UPDATE_COMMANDS = {
 }
 
 
-def setup_logging(path=LOG_FILE):
-    """Настроить журналирование в файл; ошибка лог-файла не прерывает аудит."""
+def setup_logging(path=None):
+    """Настроить журнал в пользовательском каталоге; ошибка не прерывает аудит."""
+    path = os.path.expanduser(path or LOG_FILE)
     try:
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
         logging.basicConfig(filename=path, level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s",
                             encoding="utf-8", force=True)
@@ -104,16 +108,49 @@ def detect_distribution(os_release=None):
 
 def parse_update_names(lines):
     """Извлечь имена пакетов, игнорируя служебные заголовки менеджеров."""
-    ignored_prefixes = ("warning", "notice", "listing...", "name", "last metadata", "repository")
+    ignored_prefixes = ("warning", "notice", "listing...", "last metadata", "repository")
     names = []
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.lower().startswith(ignored_prefixes):
             continue
-        candidate = stripped.split()[0].split("/", 1)[0]
+        candidate = stripped.split()[0].split("/", 1)[0].split(":", 1)[0]
         if candidate not in ("", "*", "=") and candidate not in names:
             names.append(candidate)
     return names
+
+
+def evaluate_permission(path, mode):
+    """Вернуть уровень режима файла; более строгая маска допустима."""
+    allowed = {"/etc/passwd": 0o644, "/etc/shadow": 0o640, "/etc/sudoers": 0o440}.get(path)
+    if allowed is None or not (mode & ~allowed):
+        return "OK"
+    sensitive = path in ("/etc/shadow", "/etc/sudoers")
+    exposed = bool(mode & 0o077)
+    return "CRITICAL" if sensitive and exposed else "WARNING"
+
+
+def classify_suid_paths(paths, allowlist=None):
+    """Разделить SUID-пути на подозрительные и ожидаемые snap/container пути."""
+    allowed = SUID_ALLOWLIST if allowlist is None else allowlist
+    unusual, isolated = [], []
+    for path in paths:
+        if path in allowed:
+            continue
+        if path.startswith(SUID_IGNORED_PREFIXES):
+            isolated.append(path)
+        else:
+            unusual.append(path)
+    return unusual, isolated
+
+
+def update_result_status(manager, returncode, package_names):
+    """Нормализовать разные коды возврата менеджеров обновлений."""
+    accepted = {"apt": (0,), "dnf": (0, 100), "pacman": (0, 1),
+                "zypper": (0,), "apk": (0,)}.get(manager, (0,))
+    if returncode not in accepted:
+        return "ERROR"
+    return "UPDATES" if package_names else "OK"
 
 
 def command_result(args, timeout=15):
@@ -172,9 +209,9 @@ class LinuxSecurityAudit:
                              "Без метаданных файла нельзя подтвердить его защиту.",
                              "Проверьте наличие и доступность файла: sudo stat {}".format(path), {"path": path, "error": str(exc)})
                 continue
-            if mode & ~allowed:
-                critical = path in ("/etc/shadow", "/etc/sudoers")
-                self.finding("PERM-002", "Права доступа", "CRITICAL" if critical else "WARNING",
+            level = evaluate_permission(path, mode)
+            if level != "OK":
+                self.finding("PERM-002", "Права доступа", level,
                              "Слишком широкие права у {} ({:04o}).".format(path, mode), reason,
                              "sudo chmod {:04o} {}".format(allowed, path),
                              {"path": path, "mode": "{:04o}".format(mode)})
@@ -183,10 +220,10 @@ class LinuxSecurityAudit:
                              "Текущая маска не шире принятого базового значения.",
                              "Исправление не требуется.", {"path": path, "mode": "{:04o}".format(mode)})
 
-    def check_accounts(self):
+    def check_accounts(self, passwd_path="/etc/passwd", shadow_path="/etc/shadow"):
         """Найти дополнительные UID 0 и пустые поля паролей."""
         try:
-            with open("/etc/passwd", encoding="utf-8", errors="replace") as stream:
+            with open(passwd_path, encoding="utf-8", errors="replace") as stream:
                 users = [line.rstrip("\n").split(":") for line in stream if line.count(":") >= 6]
         except OSError as exc:
             self.finding("USER-001", "Пользователи", "WARNING", "Не удалось прочитать /etc/passwd.",
@@ -202,8 +239,12 @@ class LinuxSecurityAudit:
             self.finding("USER-OK", "Пользователи", "OK", "Дополнительных UID 0 нет.",
                          "Только аккаунт root имеет UID 0.", "Исправление не требуется.")
         try:
-            with open("/etc/shadow", encoding="utf-8", errors="replace") as stream:
-                empty = [parts[0] for line in stream if len(parts := line.rstrip("\n").split(":")) > 1 and parts[1] == ""]
+            with open(shadow_path, encoding="utf-8", errors="replace") as stream:
+                empty = []
+                for line in stream:
+                    parts = line.rstrip("\n").split(":")
+                    if len(parts) > 1 and parts[1] == "":
+                        empty.append(parts[0])
         except PermissionError:
             self.finding("PASS-001", "Пароли", "WARNING", "Недостаточно прав для чтения /etc/shadow.",
                          "Нельзя проверить, есть ли аккаунты с пустым полем пароля.",
@@ -215,7 +256,7 @@ class LinuxSecurityAudit:
             return
         if empty:
             self.finding("PASS-002", "Пароли", "CRITICAL", "Обнаружено пустое поле пароля.",
-                         "Такой аккаунт может допускать вход без пароля, если это разрешают остальные настройки.",
+                         "Поле пароля пустое; возможность входа зависит от PAM и настроек службы.",
                          "Задайте пароль: sudo passwd <пользователь> (либо заблокируйте аккаунт: sudo passwd -l <пользователь>).", {"users": empty})
         else:
             self.finding("PASS-OK", "Пароли", "OK", "Пустых полей пароля не обнаружено.",
@@ -324,7 +365,7 @@ class LinuxSecurityAudit:
                          "Проверка не завершена.", "Убедитесь, что доступна команда find.", {"error": str(exc)})
             return
         found = sorted(set(path.strip() for path in proc.stdout.splitlines() if path.strip()))
-        unusual = [path for path in found if path not in allowlist]
+        unusual, isolated = classify_suid_paths(found, allowlist)
         ownership = SUID_OWNER_COMMANDS.get(self.distro["package_manager"], "file")
         if unusual:
             details = [{"path": path, "owner_check": "{} {}".format(ownership, shlex.quote(path))}
@@ -335,9 +376,15 @@ class LinuxSecurityAudit:
                          "Проверьте каждый путь командами ls -l <путь> и {} <путь>; удаляйте SUID-бит только после проверки.".format(ownership),
                          {"files": details, "scanned_count": len(found), "allowlist": sorted(allowlist)})
         else:
-            self.finding("SUID-OK", "SUID", "OK", "Вне базового списка SUID-файлы не найдены.",
-                         "Найденные файлы совпадают с базовым allowlist.", "Исправление не требуется.",
-                         {"scanned_count": len(found), "allowlist": sorted(allowlist)})
+            self.finding("SUID-OK", "SUID", "OK", "Необычных SUID-файлов вне исключений не найдено.",
+                         "Файлы совпали с базовым allowlist или находятся в изолированных путях.",
+                         "Исправление не требуется.", {"scanned_count": len(found), "allowlist": sorted(allowlist)})
+        if isolated:
+            self.finding("SUID-003", "SUID", "INFO",
+                         "SUID-файлы в путях snap/контейнеров: {}.".format(len(isolated)),
+                         "Образы и изолированные пакетные файловые системы могут содержать штатные SUID-бинарники; эта классификация не подтверждает их безопасность.",
+                         "Действий не требуется, если эти образы и пакеты доверенные.",
+                         {"count": len(isolated), "files": isolated[:10]})
 
     def check_updates(self):
         """Получить список доступных обновлений без их установки."""
@@ -360,24 +407,29 @@ class LinuxSecurityAudit:
             lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
         # У разных менеджеров различный формат; отбрасываем WARNING/NOTICE и заголовки.
         names = parse_update_names(lines)
-        updates_found = bool(names) and (proc is not None and proc.returncode in (0, 100))
-        if updates_found:
+        status = update_result_status(manager, proc.returncode, names) if proc is not None else "ERROR"
+        if status == "ERROR":
+            self.finding("UPD-001", "Обновления", "WARNING", "Менеджер пакетов не смог проверить обновления.",
+                         "Проверка завершилась ошибкой; возможно, нужны права или доступ к репозиториям.",
+                         UPDATE_COMMANDS.get(manager, "Проверьте настройки репозиториев."),
+                         {"error": proc.stderr.strip() if proc else "команда не запущена",
+                          "returncode": proc.returncode if proc else None})
+        elif status == "UPDATES":
             self.finding("UPD-002", "Обновления", "WARNING", "Доступны обновления пакетов ({}).".format(len(names)),
                          "Неустановленные обновления могут содержать исправления известных уязвимостей.",
                          UPDATE_COMMANDS.get(manager, "Обновите систему штатным менеджером пакетов."),
                          {"packages": names, "count": len(names), "package_manager": manager})
-        elif proc is None or proc.returncode not in (0, 100):
-            self.finding("UPD-001", "Обновления", "WARNING", "Менеджер пакетов не смог проверить обновления.",
-                         "Проверка завершилась ошибкой; возможно, нужны права или доступ к репозиториям.",
-                         UPDATE_COMMANDS.get(manager, "Проверьте настройки репозиториев."),
-                         {"error": proc.stderr.strip() if proc else "команда не запущена"})
         else:
             self.finding("UPD-OK", "Обновления", "OK", "Список ожидающих обновления пакетов пуст.",
                          "Менеджер пакетов не сообщил об обновлениях.", "Исправление не требуется.")
 
-    def check_ssh(self):
+    def check_ssh(self, path="/etc/ssh/sshd_config"):
         """Проверить активные директивы SSH в основном sshd_config."""
-        path = "/etc/ssh/sshd_config"
+        if not os.path.exists(path):
+            self.finding("SSH-000", "SSH", "INFO", "OpenSSH Server не установлен — проверка пропущена.",
+                         "Файл sshd_config отсутствует.",
+                         "Устанавливайте openssh-server только если нужен удалённый доступ.", {"path": path})
+            return
         try:
             with open(path, encoding="utf-8", errors="replace") as stream:
                 lines = stream.readlines()
@@ -397,7 +449,7 @@ class LinuxSecurityAudit:
                          "Компрометация root-пароля сразу даёт удалённые административные права.",
                          "Установите PermitRootLogin no в sshd_config, затем проверьте конфигурацию и перезапустите sshd.")
         else:
-            self.finding("SSH-OK", "SSH", "OK", "Явное PermitRootLogin yes не задано.",
+            self.finding("SSH-OK-ROOT", "SSH", "OK", "Явное PermitRootLogin yes не задано.",
                          "Прямой вход root не разрешён явной директивой yes.", "Исправление не требуется.", {"value": root})
         password = config.get("passwordauthentication", "default")
         if password == "yes":
@@ -405,7 +457,7 @@ class LinuxSecurityAudit:
                          "Пароли подвержены перебору и повторному использованию; ключи обычно надёжнее.",
                          "После проверки доступа по ключу установите PasswordAuthentication no в sshd_config и перезапустите sshd.")
         else:
-            self.finding("SSH-OK", "SSH", "OK", "Явное PasswordAuthentication yes не задано.",
+            self.finding("SSH-OK-PASS", "SSH", "OK", "Явное PasswordAuthentication yes не задано.",
                          "Парольный вход не разрешён явной директивой yes.", "Исправление не требуется.", {"value": password})
 
     def run(self):
@@ -560,14 +612,57 @@ class AuditSelfTests(unittest.TestCase):
         names = parse_update_names([
             "WARNING: apt does not have a stable CLI interface.",
             "Listing... Done", "curl/jammy 7.81 amd64 [upgradable from: 7.80]",
-            "curl/jammy 7.81 amd64 [upgradable from: 7.80]", "openssl/jammy 3.0 all",
+            "curl/jammy 7.81 amd64 [upgradable from: 7.80]",
+            "linux-image-6.8.0-45:amd64/jammy 6.8.0 amd64", "name/stable 1 all",
+            "openssl/jammy 3.0 all",
         ])
-        self.assertEqual(names, ["curl", "openssl"])
+        self.assertEqual(names, ["curl", "linux-image-6.8.0-45", "name", "openssl"])
 
     def test_suid_allowlist_is_defined(self):
         self.assertIn("/usr/bin/passwd", SUID_ALLOWLIST)
         self.assertEqual(SUID_OWNER_COMMANDS["apt"], "dpkg -S")
         self.assertEqual(SUID_OWNER_COMMANDS["dnf"], "rpm -qf")
+
+    def test_restrictive_permissions_are_accepted(self):
+        self.assertEqual(evaluate_permission("/etc/passwd", 0o600), "OK")
+        self.assertEqual(evaluate_permission("/etc/shadow", 0o600), "OK")
+        self.assertEqual(evaluate_permission("/etc/passwd", 0o664), "WARNING")
+        self.assertEqual(evaluate_permission("/etc/shadow", 0o644), "CRITICAL")
+
+    def test_suid_snap_paths_are_classified_as_info(self):
+        unusual, isolated = classify_suid_paths([
+            "/snap/core22/usr/bin/passwd", "/var/lib/docker/overlay2/layer/usr/bin/su",
+            "/opt/strange-suid", "/usr/bin/passwd",
+        ])
+        self.assertEqual(unusual, ["/opt/strange-suid"])
+        self.assertEqual(len(isolated), 2)
+
+    def test_missing_ssh_config_is_info(self):
+        audit = LinuxSecurityAudit()
+        audit.check_ssh(path="/definitely/missing/sshd_config")
+        self.assertEqual(len(audit.results), 1)
+        self.assertEqual(audit.results[0]["id"], "SSH-000")
+        self.assertEqual(audit.results[0]["level"], "INFO")
+
+    def test_empty_shadow_password_is_critical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            passwd_path = os.path.join(directory, "passwd")
+            shadow_path = os.path.join(directory, "shadow")
+            with open(passwd_path, "w", encoding="utf-8") as stream:
+                stream.write("root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000::/home/alice:/bin/sh\n")
+            with open(shadow_path, "w", encoding="utf-8") as stream:
+                stream.write("root:!:1:0:99999:7:::\nalice::1:0:99999:7:::\n")
+            audit = LinuxSecurityAudit()
+            audit.check_accounts(passwd_path, shadow_path)
+            result = next(item for item in audit.results if item["id"] == "PASS-002")
+            self.assertEqual(result["level"], "CRITICAL")
+            self.assertEqual(result["details"]["users"], ["alice"])
+
+    def test_pacman_no_updates_is_success(self):
+        self.assertEqual(update_result_status("pacman", 1, []), "OK")
+        self.assertEqual(update_result_status("pacman", 0, ["bash"]), "UPDATES")
+        self.assertEqual(update_result_status("apt", 2, []), "ERROR")
+        self.assertEqual(update_result_status("dnf", 100, ["bash"]), "UPDATES")
 
     def test_update_commands_exist(self):
         for manager in ("apt", "dnf", "pacman", "zypper", "apk"):
@@ -599,6 +694,7 @@ def interactive_app():
         print("{}╠════════════════════════════════════════════════════╣{}".format(header, reset))
         print("{}║  1. Запустить полный аудит                         ║{}".format(header, reset))
         print("{}║  2. Запустить самопроверку                          ║{}".format(header, reset))
+        print("{}║  c. Очистить экран                                  ║{}".format(header, reset))
         print("{}║  3. Выход                                           ║{}".format(header, reset))
         print("{}╚════════════════════════════════════════════════════╝{}".format(header, reset))
         try:
@@ -606,6 +702,10 @@ def interactive_app():
         except (EOFError, KeyboardInterrupt):
             print("\nРабота завершена.")
             return 0
+        if choice in ("c", "clear", "очистить"):
+            if sys.stdout.isatty():
+                print("\033[2J\033[H", end="", flush=True)
+            continue
         if choice in ("3", "q", "quit", "выход"):
             print("Работа завершена.")
             return 0
@@ -642,7 +742,7 @@ def main(argv=None):
     setup_logging(args.log_file)
     if args.self_test:
         return 0 if run_self_tests() else 1
-    if args.menu or (not args.once and not args.json and sys.stdin.isatty() and len(sys.argv) == 1):
+    if args.menu or (not args.once and not args.json and sys.stdin.isatty()):
         return interactive_app()
     report = LinuxSecurityAudit().run()
     if args.json:

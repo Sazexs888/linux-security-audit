@@ -1,4 +1,14 @@
 #!/bin/sh
-# Удобный запуск приложения из любой текущей директории.
+# Запуск интерактивного меню или переданных CLI-флагов.
 APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
+    exec python3 "$APP_DIR/audit_pro.py" --once
+fi
+for arg in "$@"; do
+    case "$arg" in
+        --once|--json|--self-test)
+            exec python3 "$APP_DIR/audit_pro.py" "$@"
+            ;;
+    esac
+done
 exec python3 "$APP_DIR/audit_pro.py" --menu "$@"
