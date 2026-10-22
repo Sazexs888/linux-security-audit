@@ -8,6 +8,7 @@
 """
 
 import argparse
+import glob
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ import unittest
 import tempfile
 from datetime import datetime, timezone
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 LOG_FILE = os.path.expanduser("~/.local/share/linux_audit/audit.log")
 
 
@@ -64,18 +65,39 @@ UPDATE_COMMANDS = {
 
 
 def setup_logging(path=None):
-    """Настроить журнал в пользовательском каталоге; ошибка не прерывает аудит."""
+    """Открыть приватный журнал, не меняя права уже существующих файлов."""
     path = os.path.expanduser(path or LOG_FILE)
+    fd = None
+    stream = None
     try:
-        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
-        logging.basicConfig(filename=path, level=logging.INFO,
-                            format="%(asctime)s %(levelname)s %(message)s",
-                            encoding="utf-8", force=True)
+        log_dir = os.path.dirname(path) or "."
+        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        # O_NOFOLLOW не позволяет незаметно открыть symlink и менять/дописывать
+        # файл, на который он указывает. Для нового файла режим 0600 применяется
+        # непосредственно при создании; права существующего файла не меняются.
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path, flags, 0o600)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError("путь журнала не является обычным файлом")
+        if stat.S_IMODE(file_stat.st_mode) & 0o077:
+            raise PermissionError("у существующего журнала есть права для группы или остальных")
+
+        stream = os.fdopen(fd, "a", encoding="utf-8")
+        fd = None  # Дескриптор теперь закрывается вместе с объектом stream.
+        handler = logging.StreamHandler(stream)
+        logging.basicConfig(handlers=[handler], level=logging.INFO,
+                            format="%(asctime)s %(levelname)s %(message)s", force=True)
         logging.info("Запуск Linux Security Audit Tool %s", VERSION)
         return path
-    except (OSError, TypeError):
+    except (OSError, TypeError, ValueError) as exc:
+        if fd is not None:
+            os.close(fd)
+        if stream is not None:
+            stream.close()
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s", force=True)
-        logging.warning("Не удалось открыть %s; используется stderr.", path)
+        logging.warning("Не удалось безопасно открыть журнал %s (%s); используется stderr.", path, exc)
         return None
 
 
@@ -162,6 +184,58 @@ def command_result(args, timeout=15):
         return None
 
 
+def parse_sshd_config_tree(main_path="/etc/ssh/sshd_config"):
+    """Прочитать глобальные параметры sshd_config и Include без Match-значений."""
+    config = {}
+    active_paths = set()
+    has_match = False
+
+    def _read_file(filepath, conditional=False):
+        nonlocal has_match
+        if not os.path.isfile(filepath):
+            return conditional
+        real_path = os.path.realpath(filepath)
+        if real_path in active_paths:
+            logging.warning("Циклический Include в конфигурации SSH: %s", filepath)
+            return conditional
+        active_paths.add(real_path)
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split("#", 1)[0].split(None, 1)
+                    if len(parts) < 2:
+                        continue
+                    key = parts[0].lower()
+                    val = parts[1].strip()
+                    if key == "match":
+                        has_match = True
+                        conditional = True
+                        continue
+                    if key == "include":
+                        for include_pattern in shlex.split(val):
+                            pattern = (include_pattern if include_pattern.startswith("/") else
+                                       os.path.join(os.path.dirname(filepath), include_pattern))
+                            for inc_path in sorted(glob.glob(pattern)):
+                                conditional = _read_file(inc_path, conditional)
+                    elif not conditional:
+                        # В OpenSSH первое указанное значение имеет наивысший приоритет
+                        if key not in config:
+                            config[key] = val.lower()
+        except OSError as exc:
+            logging.warning("Не удалось прочитать SSH конфиг %s: %s", filepath, exc)
+        finally:
+            active_paths.discard(real_path)
+        return conditional
+
+    _read_file(main_path)
+    if has_match:
+        config["_has_match"] = "yes"
+    return config
+
+
 class LinuxSecurityAudit:
     """Аудитор Linux: собирает findings, не изменяя настройки системы."""
 
@@ -169,6 +243,7 @@ class LinuxSecurityAudit:
         self.results = []
         self.system = {}
         self.distro = detect_distribution()
+        self.is_root = hasattr(os, "geteuid") and os.geteuid() == 0
 
     def finding(self, check_id, category, level, title, reason, remediation, details=None):
         """Добавить структурированную находку с объяснением и советом."""
@@ -188,6 +263,7 @@ class LinuxSecurityAudit:
             "package_manager": self.distro["package_manager"],
             "kernel": result.stdout.strip() if result and result.returncode == 0 else platform.release(),
             "architecture": platform.machine(),
+            "is_root": self.is_root,
             "audit_time_utc": datetime.now(timezone.utc).isoformat(),
         }
         self.finding("SYS-001", "Система", "INFO", "Определена ОС и версия ядра.",
@@ -205,7 +281,8 @@ class LinuxSecurityAudit:
             try:
                 mode = stat.S_IMODE(os.stat(path, follow_symlinks=True).st_mode)
             except OSError as exc:
-                self.finding("PERM-001", "Права доступа", "WARNING", "Не удалось проверить {}.".format(path),
+                lvl = "WARNING" if not self.is_root else "CRITICAL"
+                self.finding("PERM-001", "Права доступа", lvl, "Не удалось проверить {}.".format(path),
                              "Без метаданных файла нельзя подтвердить его защиту.",
                              "Проверьте наличие и доступность файла: sudo stat {}".format(path), {"path": path, "error": str(exc)})
                 continue
@@ -247,8 +324,8 @@ class LinuxSecurityAudit:
                         empty.append(parts[0])
         except PermissionError:
             self.finding("PASS-001", "Пароли", "WARNING", "Недостаточно прав для чтения /etc/shadow.",
-                         "Нельзя проверить, есть ли аккаунты с пустым полем пароля.",
-                         "Повторите аудит с правами root.")
+                         "Нельзя проверить, есть ли аккаунты с пустым полем пароля без прав root.",
+                         "Запустите аудит с правами суперпользователя: sudo ./audit_pro.py")
             return
         except OSError as exc:
             self.finding("PASS-001", "Пароли", "WARNING", "Не удалось прочитать /etc/shadow.",
@@ -339,16 +416,14 @@ class LinuxSecurityAudit:
                              "Верхний уровень каталога проверен.", "Исправление не требуется.")
 
     def check_suid_files(self):
-        """Найти SUID-файлы и отметить записи вне небольшого базового allowlist."""
+        """Найти SUID-файлы с флагом -xdev (строго в пределах одной локальной ФС)."""
         allowlist = SUID_ALLOWLIST
-        # find только читает метаданные. Ограничение по времени защищает от зависания
-        # на сетевых или неисправных файловых системах; stderr подавлен из-за
-        # ожидаемых ошибок доступа при запуске без root.
+        # Флаг -xdev гарантирует отсутствие перехода на сетевые хранилища (NFS/CIFS) или другие устройства.
         try:
             proc = subprocess.run(
-                ["find", "/", "-perm", "-4000", "-type", "f"],
+                ["find", "/", "-xdev", "-perm", "-4000", "-type", "f"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, check=False, timeout=120,
+                text=True, check=False, timeout=90,
             )
         except FileNotFoundError:
             self.finding("SUID-001", "SUID", "WARNING", "Команда find не найдена.",
@@ -357,8 +432,8 @@ class LinuxSecurityAudit:
             return
         except subprocess.TimeoutExpired:
             self.finding("SUID-001", "SUID", "WARNING", "Сканирование SUID-файлов превысило лимит времени.",
-                         "Полный проход по файловой системе может быть долгим или блокироваться сетевым хранилищем.",
-                         "Повторите аудит в период низкой нагрузки и проверьте доступность файловых систем.")
+                         "Поиск SUID-бинарников занял слишком много времени.",
+                         "Повторите аудит в период низкой нагрузки на диск.")
             return
         except OSError as exc:
             self.finding("SUID-001", "SUID", "WARNING", "Не удалось запустить поиск SUID-файлов.",
@@ -405,12 +480,11 @@ class LinuxSecurityAudit:
             lines = []
         else:
             lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-        # У разных менеджеров различный формат; отбрасываем WARNING/NOTICE и заголовки.
         names = parse_update_names(lines)
         status = update_result_status(manager, proc.returncode, names) if proc is not None else "ERROR"
         if status == "ERROR":
             self.finding("UPD-001", "Обновления", "WARNING", "Менеджер пакетов не смог проверить обновления.",
-                         "Проверка завершилась ошибкой; возможно, нужны права или доступ к репозиториям.",
+                         "Проверка завершилась ошибкой; возможно, нужны права root или отсутствует интернет-соединение.",
                          UPDATE_COMMANDS.get(manager, "Проверьте настройки репозиториев."),
                          {"error": proc.stderr.strip() if proc else "команда не запущена",
                           "returncode": proc.returncode if proc else None})
@@ -424,41 +498,47 @@ class LinuxSecurityAudit:
                          "Менеджер пакетов не сообщил об обновлениях.", "Исправление не требуется.")
 
     def check_ssh(self, path="/etc/ssh/sshd_config"):
-        """Проверить активные директивы SSH в основном sshd_config."""
+        """Проверить активные директивы SSH с рекурсивной обработкой Include."""
         if not os.path.exists(path):
             self.finding("SSH-000", "SSH", "INFO", "OpenSSH Server не установлен — проверка пропущена.",
                          "Файл sshd_config отсутствует.",
                          "Устанавливайте openssh-server только если нужен удалённый доступ.", {"path": path})
             return
-        try:
-            with open(path, encoding="utf-8", errors="replace") as stream:
-                lines = stream.readlines()
-        except OSError as exc:
-            self.finding("SSH-001", "SSH", "WARNING", "Не удалось прочитать sshd_config.",
-                         "Настройки удалённого входа остались непроверенными.",
-                         "Проверьте OpenSSH Server и файл {}.".format(path), {"error": str(exc)})
+
+        config = parse_sshd_config_tree(path)
+        has_match = config.pop("_has_match", "no") == "yes"
+        if not config and not has_match:
+            self.finding("SSH-001", "SSH", "WARNING", "Не удалось прочитать параметры sshd_config.",
+                         "Конфигурационный файл пуст или недоступен для чтения.",
+                         "Проверьте права доступа к каталогу /etc/ssh/.", {"path": path})
             return
-        config = {}
-        for line in lines:
-            parts = line.split("#", 1)[0].split()
-            if len(parts) >= 2:
-                config.setdefault(parts[0].lower(), parts[1].lower())
-        root = config.get("permitrootlogin", "default")
+
+        root = config.get("permitrootlogin", "prohibit-password")
         if root == "yes":
             self.finding("SSH-002", "SSH", "CRITICAL", "SSH разрешает прямой вход root.",
                          "Компрометация root-пароля сразу даёт удалённые административные права.",
-                         "Установите PermitRootLogin no в sshd_config, затем проверьте конфигурацию и перезапустите sshd.")
+                         "Установите PermitRootLogin no в sshd_config (или в sshd_config.d/), проверьте конфиг и перезапустите ssh.",
+                         {"actual_value": root})
         else:
-            self.finding("SSH-OK-ROOT", "SSH", "OK", "Явное PermitRootLogin yes не задано.",
-                         "Прямой вход root не разрешён явной директивой yes.", "Исправление не требуется.", {"value": root})
-        password = config.get("passwordauthentication", "default")
+            self.finding("SSH-OK-ROOT", "SSH", "OK", "Прямой вход root под паролем заблокирован.",
+                         "Значение PermitRootLogin не равно 'yes'.", "Исправление не требуется.", {"value": root})
+
+        password = config.get("passwordauthentication", "yes")
         if password == "yes":
             self.finding("SSH-003", "SSH", "WARNING", "SSH разрешает парольную аутентификацию.",
-                         "Пароли подвержены перебору и повторному использованию; ключи обычно надёжнее.",
-                         "После проверки доступа по ключу установите PasswordAuthentication no в sshd_config и перезапустите sshd.")
+                         "Пароли подвержены перебору и перехвату; вход по SSH-ключам безопаснее.",
+                         "Настройте вход по SSH-ключам и задайте PasswordAuthentication no в sshd_config.",
+                         {"actual_value": password})
         else:
-            self.finding("SSH-OK-PASS", "SSH", "OK", "Явное PasswordAuthentication yes не задано.",
-                         "Парольный вход не разрешён явной директивой yes.", "Исправление не требуется.", {"value": password})
+            self.finding("SSH-OK-PASS", "SSH", "OK", "Парольный вход по SSH отключен.",
+                         "Используется аутентификация по публичным ключам.", "Исправление не требуется.", {"value": password})
+
+        if has_match:
+            self.finding("SSH-004", "SSH", "WARNING",
+                         "В SSH-конфигурации есть условные блоки Match.",
+                         "Их настройки зависят от пользователя и адреса подключения и не сводятся к одному глобальному значению.",
+                         "Проверьте эффективные параметры для нужного подключения: sudo sshd -T -C user=ИМЯ,host=ИМЯ_ХОСТА,addr=IP",
+                         {"conditional_settings_checked": False})
 
     def run(self):
         """Запустить весь набор проверок и вернуть сериализуемый отчёт."""
@@ -519,7 +599,7 @@ def print_banner(color=True):
  |_____|_|_| |_|\__,_/_/\_\\____|\___|\___|\__,_|_|\__|
              SECURITY AUDIT & REMEDIATION TOOL v""" + VERSION + "\n" + reset)
     if hasattr(os, "geteuid") and os.geteuid() != 0:
-        print("{}[!] Запущено без прав root. Некоторые проверки будут пропущены.{}\n".format(yellow, reset))
+        print("{}[!] Запущено без root: часть проверок (/etc/shadow, закрытые сокеты) будут ограничены.{}\n".format(yellow, reset))
 
 
 def print_report(report, color=True):
@@ -643,6 +723,23 @@ class AuditSelfTests(unittest.TestCase):
         self.assertEqual(len(audit.results), 1)
         self.assertEqual(audit.results[0]["id"], "SSH-000")
         self.assertEqual(audit.results[0]["level"], "INFO")
+
+    def test_ssh_include_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            main_conf = os.path.join(directory, "sshd_config")
+            inc_dir = os.path.join(directory, "sshd_config.d")
+            os.makedirs(inc_dir, exist_ok=True)
+            custom_conf = os.path.join(inc_dir, "50-cloud.conf")
+
+            with open(main_conf, "w", encoding="utf-8") as stream:
+                stream.write("Include {}/*.conf\nPasswordAuthentication yes\n".format(inc_dir))
+            with open(custom_conf, "w", encoding="utf-8") as stream:
+                stream.write("PermitRootLogin no\nPasswordAuthentication no\n")
+
+            cfg = parse_sshd_config_tree(main_conf)
+            self.assertEqual(cfg.get("permitrootlogin"), "no")
+            # Значение из Include парсится первым, поэтому PasswordAuthentication равен 'no'
+            self.assertEqual(cfg.get("passwordauthentication"), "no")
 
     def test_empty_shadow_password_is_critical(self):
         with tempfile.TemporaryDirectory() as directory:
